@@ -22,10 +22,16 @@ configurations.all {
         force("org.jetbrains.kotlin:kotlin-stdlib-jdk7:2.2.10")
         force("org.jetbrains.kotlin:kotlin-stdlib-common:2.2.10")
     }
+    // Kotlin stdlib and kotlinx libraries must NOT be bundled in the extension DEX —
+    // they must be resolved from the Echo host app's classloader at runtime.
     exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
     exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
     exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk7")
     exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-common")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-core")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-core-jvm")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-serialization-core")
+    exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-serialization-json")
 }
 
 java {
@@ -56,7 +62,6 @@ val gitCount = execute("git", "rev-list", "--count", "HEAD").toInt()
 val verCode = gitCount
 val verName = "v$gitHash"
 
-
 val outputDir = file("${layout.buildDirectory.asFile.get()}/generated/proguard")
 val generatedProguard = file("${outputDir}/generated-rules.pro")
 
@@ -65,8 +70,10 @@ tasks.register("generateProguardRules") {
         outputDir.mkdirs()
         generatedProguard.writeText(
             """
+                -dontoptimize
                 -dontobfuscate
-                -keep,allowoptimization class dev.brahmkshatriya.echo.extension.** { *; }
+                -keep,allowoptimization class dev.brahmkshatriya.echo.extension.$extClass
+                -keep class dev.brahmkshatriya.echo.extension.** { *; }
                 -keep class org.libtorrent4j.** { *; }
                 -keep class com.frostwire.jlibtorrent.** { *; }
                 -keep class org.libtorrent4j.swig.libtorrent_jni { *; }
@@ -114,13 +121,15 @@ android {
         all {
             isMinifyEnabled = true
             proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
+                getDefaultProguardFile("proguard-android.txt"),
                 generatedProguard.absolutePath
             )
         }
     }
 }
 
-fun execute(vararg command: String): String = providers.exec {
-    commandLine(*command)
-}.standardOutput.asText.get().trim()
+fun execute(vararg command: String): String = runCatching {
+    providers.exec {
+        commandLine(*command)
+    }.standardOutput.asText.get().trim()
+}.getOrElse { "1" }
