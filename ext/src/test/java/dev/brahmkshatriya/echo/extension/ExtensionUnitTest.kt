@@ -139,19 +139,65 @@ class ExtensionUnitTest {
         if (extension !is AlbumClient) error("AlbumClient is not implemented")
         if (extension !is TrackClient) error("TrackClient is not implemented")
 
+        // 1. Series: Breaking Bad
         val initialAlbum = Album(id = "series:tt0903747", title = "Breaking Bad", cover = null, artists = emptyList())
         val tracks = extension.loadTracks(initialAlbum)?.loadAll() ?: emptyList()
         val firstTrack = tracks.firstOrNull() ?: error("No tracks")
         val streamable = firstTrack.servers.firstOrNull() ?: error("Track has no servers")
 
         val media = extension.loadStreamableMedia(streamable, false)
-        println("Loaded media: $media")
+        println("Loaded series media: $media")
         if (media is Streamable.Media.Server) {
-            println("Found ${media.sources.size} stream sources:")
-            media.sources.take(4).forEach { source ->
-                println("  Source: ${source.title} | Quality: ${source.quality}")
+            println("Found ${media.sources.size} stream sources for Breaking Bad:")
+            media.sources.take(2).forEach { source ->
+                println("  Source: ${source.title} | Quality: ${source.quality} | URL: ${(source as? Streamable.Source.Http)?.request?.url}")
             }
-            assert(media.sources.isNotEmpty()) { "No stream sources returned" }
+            assert(media.sources.isNotEmpty()) { "No stream sources returned for series" }
+        }
+
+        // 2. Movie: Fight Club
+        val movieAlbum = Album(id = "movie:tt0137523", title = "Fight Club", cover = null, artists = emptyList())
+        val movieTracks = extension.loadTracks(movieAlbum)?.loadAll() ?: emptyList()
+        val firstMovieTrack = movieTracks.firstOrNull() ?: error("No movie tracks")
+        val movieStreamable = firstMovieTrack.servers.firstOrNull() ?: error("Movie track has no servers")
+        val movieMedia = extension.loadStreamableMedia(movieStreamable, false)
+        println("Loaded movie media: $movieMedia")
+        if (movieMedia is Streamable.Media.Server) {
+            println("Found ${movieMedia.sources.size} stream sources for Fight Club:")
+            movieMedia.sources.take(2).forEach { source ->
+                println("  Source: ${source.title} | Quality: ${source.quality} | URL: ${(source as? Streamable.Source.Http)?.request?.url}")
+            }
+            assert(movieMedia.sources.isNotEmpty()) { "No stream sources returned for movie" }
+        }
+
+        // 3. Anime: Attack on Titan (16498)
+        val animeAlbum = Album(id = "anime:16498", title = "Attack on Titan", cover = null, artists = emptyList())
+        val animeTracks = extension.loadTracks(animeAlbum)?.loadAll() ?: emptyList()
+        val firstAnimeTrack = animeTracks.firstOrNull() ?: error("No anime tracks")
+        val animeStreamable = firstAnimeTrack.servers.firstOrNull() ?: error("Anime track has no servers")
+        val animeMedia = extension.loadStreamableMedia(animeStreamable, false)
+        println("Loaded anime media: $animeMedia")
+        if (animeMedia is Streamable.Media.Server) {
+            println("Found ${animeMedia.sources.size} stream sources for Attack on Titan:")
+            animeMedia.sources.take(2).forEach { source ->
+                println("  Source: ${source.title} | Quality: ${source.quality} | URL: ${(source as? Streamable.Source.Http)?.request?.url}")
+            }
+            assert(animeMedia.sources.isNotEmpty()) { "No stream sources returned for anime" }
+        }
+
+        // 4. Anime: Dandadan (171018)
+        val dddAlbum = Album(id = "anime:171018", title = "Dandadan", cover = null, artists = emptyList())
+        val dddTracks = extension.loadTracks(dddAlbum)?.loadAll() ?: emptyList()
+        val firstDddTrack = dddTracks.firstOrNull() ?: error("No Dandadan tracks")
+        val dddStreamable = firstDddTrack.servers.firstOrNull() ?: error("Dandadan track has no servers")
+        val dddMedia = extension.loadStreamableMedia(dddStreamable, false)
+        println("Loaded Dandadan media: $dddMedia")
+        if (dddMedia is Streamable.Media.Server) {
+            println("Found ${dddMedia.sources.size} stream sources for Dandadan:")
+            dddMedia.sources.take(2).forEach { source ->
+                println("  Source: ${source.title} | Quality: ${source.quality} | URL: ${(source as? Streamable.Source.Http)?.request?.url}")
+            }
+            assert(dddMedia.sources.isNotEmpty()) { "No stream sources returned for Dandadan" }
         }
     }
 
