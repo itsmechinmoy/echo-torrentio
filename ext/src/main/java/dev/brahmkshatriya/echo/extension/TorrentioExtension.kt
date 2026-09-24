@@ -60,6 +60,7 @@ class TorrentioExtension :
     }
 
     private val client: OkHttpClient = OkHttpClient.Builder()
+        .dns(ResilientDns())
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(25, TimeUnit.SECONDS)
@@ -80,8 +81,8 @@ class TorrentioExtension :
     }
 
     override suspend fun onInitialize() {
-        // Pre-warm TorrentServerManager in the background
         TorrentServerManager.logger = { println("[TorrentServerManager] $it") }
+        TorrentServerManager.initNativeLibrary()
     }
 
     // ============================== Home Feed ==============================
@@ -262,9 +263,15 @@ class TorrentioExtension :
                 ?: throw IllegalArgumentException("Missing AniList ID for album: $id")
 
             val aniZip = fetchAniZipMappings(anilistId = anilistId.toString())
-            val kitsuId = aniZip?.mappings?.kitsuId?.toString()
+            var kitsuId = aniZip?.mappings?.kitsuId?.toString()
                 ?: resolveKitsuIdFromAnilist(anilistId.toString())
                 ?: ""
+
+            if (kitsuId.isBlank()) {
+                kitsuId = searchKitsuByTitle(album.title) ?: ""
+            }
+
+            val imdbId = aniZip?.mappings?.imdbId ?: ""
 
             val format = aniZip?.mappings?.type ?: album.extras["format"] ?: ""
             if (format.equals("MOVIE", ignoreCase = true)) {
@@ -285,14 +292,17 @@ class TorrentioExtension :
                                 "mediaType" to "anime_movie",
                                 "kitsuId" to kitsuId,
                                 "anilistId" to anilistId.toString(),
-                                "title" to album.title
+                                "title" to album.title,
+                                "imdbId" to imdbId
                             )
                         )
                     ),
                     extras = mapOf(
                         "mediaType" to "anime_movie",
                         "kitsuId" to kitsuId,
-                        "anilistId" to anilistId.toString()
+                        "anilistId" to anilistId.toString(),
+                        "title" to album.title,
+                        "imdbId" to imdbId
                     )
                 )
                 return listOf(track).toFeed()
@@ -336,7 +346,8 @@ class TorrentioExtension :
                                     "kitsuId" to kitsuId,
                                     "epNum" to formatEpNumber(epNumber),
                                     "anilistId" to anilistId.toString(),
-                                    "title" to album.title
+                                    "title" to album.title,
+                                    "imdbId" to imdbId
                                 )
                             )
                         ),
@@ -344,7 +355,9 @@ class TorrentioExtension :
                             "mediaType" to "anime_series",
                             "kitsuId" to kitsuId,
                             "epNum" to formatEpNumber(epNumber),
-                            "anilistId" to anilistId.toString()
+                            "anilistId" to anilistId.toString(),
+                            "title" to album.title,
+                            "imdbId" to imdbId
                         )
                     )
                 }.sortedBy { it.extras["epNum"]?.toFloatOrNull() ?: 0f }
@@ -373,7 +386,8 @@ class TorrentioExtension :
                                 "kitsuId" to kitsuId,
                                 "epNum" to epNum.toString(),
                                 "anilistId" to anilistId.toString(),
-                                "title" to album.title
+                                "title" to album.title,
+                                "imdbId" to imdbId
                             )
                         )
                     ),
@@ -381,7 +395,9 @@ class TorrentioExtension :
                         "mediaType" to "anime_series",
                         "kitsuId" to kitsuId,
                         "epNum" to epNum.toString(),
-                        "anilistId" to anilistId.toString()
+                        "anilistId" to anilistId.toString(),
+                        "title" to album.title,
+                        "imdbId" to imdbId
                     )
                 )
             }
@@ -475,7 +491,24 @@ class TorrentioExtension :
     // ============================== Track Client ==============================
 
     override suspend fun loadTrack(track: Track, isDownload: Boolean): Track {
-        return track
+        if (track.streamables.isNotEmpty()) return track
+
+        val extras = track.extras.toMutableMap()
+        val mediaType = extras["mediaType"] ?: when {
+            track.id.startsWith("movie_") -> "movie"
+            track.id.startsWith("series_") -> "series"
+            track.id.startsWith("anime_") -> "anime_series"
+            else -> "movie"
+        }
+        extras["mediaType"] = mediaType
+
+        val streamable = Streamable.server(
+            id = "stream_${track.id}",
+            title = "Torrentio Stream",
+            quality = 1080,
+            extras = extras
+        )
+        return track.copy(streamables = mutableListOf(streamable))
     }
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? {
@@ -489,45 +522,97 @@ class TorrentioExtension :
         isDownload: Boolean
     ): Streamable.Media {
         val mediaType = streamable.extras["mediaType"] ?: "movie"
-        val kitsuId = streamable.extras["kitsuId"]
-        val epNum = streamable.extras["epNum"]
-        val imdbId = streamable.extras["imdbId"]
-        val videoId = streamable.extras["videoId"]
+        val kitsuId = streamable.extras["kitsuId"]?.takeIf { it.isNotBlank() }
+        val epNum = streamable.extras["epNum"] ?: "1"
+        val imdbId = streamable.extras["imdbId"]?.takeIf { it.isNotBlank() }
+        val videoId = streamable.extras["videoId"]?.takeIf { it.isNotBlank() }
+        val anilistId = streamable.extras["anilistId"]?.takeIf { it.isNotBlank() }
+        val title = streamable.extras["title"] ?: ""
 
         val debridProvider = setting?.getString(PREF_DEBRID_PROVIDER) ?: "none"
         val debridToken = setting?.getString(PREF_DEBRID_TOKEN)?.trim() ?: ""
-
-        val streamEndpoint = when (mediaType) {
-            "anime_series" -> "stream/series/kitsu:$kitsuId:$epNum.json"
-            "anime_movie" -> "stream/movie/kitsu:$kitsuId.json"
-            "movie" -> "stream/movie/$imdbId.json"
-            "series" -> "stream/series/$videoId.json"
-            else -> throw IllegalArgumentException("Unknown mediaType: $mediaType")
-        }
 
         val configPath = if (debridProvider != "none" && debridToken.isNotBlank()) {
             "$debridProvider=$debridToken"
         } else ""
 
-        val url = if (configPath.isNotEmpty()) {
-            "$TORRENTIO_BASE_URL/$configPath/$streamEndpoint"
-        } else {
-            "$TORRENTIO_BASE_URL/$streamEndpoint"
+        var streams: List<TorrentioStream> = emptyList()
+
+        // 1. Try Kitsu ID if available
+        if (!kitsuId.isNullOrBlank()) {
+            val endpoint = if (mediaType == "anime_movie") {
+                "stream/movie/kitsu:$kitsuId.json"
+            } else {
+                "stream/series/kitsu:$kitsuId:$epNum.json"
+            }
+            streams = fetchTorrentioStreams(configPath, endpoint)
         }
 
-        val responseBody = httpGet(url)
-        val streamData = json.decodeFromString<StreamDataTorrent>(responseBody)
-        val streams = streamData.streams.orEmpty()
+        // 2. If no streams and anilistId available, try dynamic Kitsu resolution / search
+        if (streams.isEmpty() && !anilistId.isNullOrBlank()) {
+            val resolvedKitsuId = resolveKitsuIdFromAnilist(anilistId)
+                ?: (if (title.isNotBlank()) searchKitsuByTitle(title) else null)
+            if (!resolvedKitsuId.isNullOrBlank() && resolvedKitsuId != kitsuId) {
+                val endpoint = if (mediaType == "anime_movie") {
+                    "stream/movie/kitsu:$resolvedKitsuId.json"
+                } else {
+                    "stream/series/kitsu:$resolvedKitsuId:$epNum.json"
+                }
+                streams = fetchTorrentioStreams(configPath, endpoint)
+            }
+        }
+
+        // 3. Fallback to IMDb ID for anime (AniZip mappings provide IMDb IDs for anime too)
+        if (streams.isEmpty() && !imdbId.isNullOrBlank()) {
+            val endpoint = if (mediaType == "anime_movie" || mediaType == "movie") {
+                "stream/movie/$imdbId.json"
+            } else {
+                val ep = epNum
+                "stream/series/$imdbId:1:$ep.json"
+            }
+            streams = fetchTorrentioStreams(configPath, endpoint)
+        }
+
+        // 4. Movies and TV Series from Cinemeta
+        if (streams.isEmpty()) {
+            when (mediaType) {
+                "movie" -> if (!imdbId.isNullOrBlank()) {
+                    streams = fetchTorrentioStreams(configPath, "stream/movie/$imdbId.json")
+                }
+                "series" -> if (!videoId.isNullOrBlank()) {
+                    streams = fetchTorrentioStreams(configPath, "stream/series/$videoId.json")
+                }
+            }
+        }
+
+        // 5. Ultimate title-based fallback on Cinemeta/IMDb if still empty
+        if (streams.isEmpty() && title.isNotBlank() && (mediaType == "movie" || mediaType == "anime_movie")) {
+            val cinemetaMovies = runCatching { searchCinemeta("movie", title) }.getOrNull().orEmpty()
+            val fallbackImdbId = cinemetaMovies.firstOrNull()?.extras?.get("imdbId")
+            if (!fallbackImdbId.isNullOrBlank() && fallbackImdbId != imdbId) {
+                streams = fetchTorrentioStreams(configPath, "stream/movie/$fallbackImdbId.json")
+            }
+        }
 
         if (streams.isEmpty()) {
-            throw Exception("No streams found on Torrentio for this title.")
+            throw Exception("No streams found on Torrentio for '$title'.")
         }
+
+        // Sort streams by health: Debrid links first (if enabled), then seeds descending, then quality
+        val isDebridActive = debridProvider != "none"
+        val sortedStreams = streams.sortedWith(
+            compareByDescending<TorrentioStream> {
+                if (isDebridActive && !it.url.isNullOrBlank()) 100_000 else parseSeeds(it)
+            }.thenByDescending {
+                parseQuality(it.name, it.title)
+            }
+        )
 
         val sources = mutableListOf<Streamable.Source>()
 
-        for (stream in streams) {
+        for (stream in sortedStreams) {
             val quality = parseQuality(stream.name, stream.title)
-            val streamTitle = formatStreamTitle(stream, debridProvider != "none" && !stream.url.isNullOrBlank())
+            val streamTitle = formatStreamTitle(stream, isDebridActive && !stream.url.isNullOrBlank())
 
             if (!stream.url.isNullOrBlank()) {
                 // Debrid direct stream
@@ -585,6 +670,16 @@ class TorrentioExtension :
         }
 
         return Streamable.Media.Server(sources = sources, merged = false)
+    }
+
+    private fun fetchTorrentioStreams(configPath: String, endpoint: String): List<TorrentioStream> {
+        val path = if (configPath.isNotBlank()) "$configPath/$endpoint" else endpoint
+        val url = "$TORRENTIO_BASE_URL/$path"
+        return runCatching {
+            val body = httpGet(url)
+            val data = json.decodeFromString<StreamDataTorrent>(body)
+            data.streams.orEmpty()
+        }.getOrDefault(emptyList())
     }
 
     // ============================== Share Client ==============================
@@ -866,6 +961,23 @@ class TorrentioExtension :
         kitsuId
     }
 
+    private suspend fun searchKitsuByTitle(title: String): String? = withContext(Dispatchers.IO) {
+        val clean = title.replace(Regex("""[^a-zA-Z0-9\s]"""), " ").trim()
+        if (clean.isBlank()) return@withContext null
+        val cacheKey = "title_$clean"
+        kitsuCache[cacheKey]?.let { return@withContext it }
+
+        val encoded = runCatching { URLEncoder.encode(clean, "UTF-8") }.getOrDefault(clean)
+        val url = "https://kitsu.io/api/edge/anime?filter[text]=$encoded&page[limit]=1"
+        val responseStr = runCatching { httpGet(url) }.getOrNull() ?: return@withContext null
+        val kitsuResp = runCatching { json.decodeFromString<KitsuMappingsResponse>(responseStr) }.getOrNull()
+        val id = kitsuResp?.data?.firstOrNull()?.id
+        if (!id.isNullOrBlank()) {
+            kitsuCache[cacheKey] = id
+        }
+        id
+    }
+
     // ============================== Cinemeta API Helpers ==============================
 
     private suspend fun loadCinemetaCatalog(type: String, page: Int): List<Album> = withContext(Dispatchers.IO) {
@@ -1014,11 +1126,48 @@ class TorrentioExtension :
         }
     }
 
+    private fun parseQualityString(name: String?, title: String?): String {
+        val combined = "${name.orEmpty()} ${title.orEmpty()}".lowercase()
+        return when {
+            combined.contains("2160p") || combined.contains("4k") || combined.contains("uhd") -> "4K"
+            combined.contains("1440p") || combined.contains("2k") -> "1440p"
+            combined.contains("1080p") || combined.contains("fhd") -> "1080p"
+            combined.contains("720p") || combined.contains("hd") -> "720p"
+            combined.contains("480p") || combined.contains("sd") -> "480p"
+            else -> "1080p"
+        }
+    }
+
+    private fun parseSeeds(stream: TorrentioStream): Int {
+        val title = stream.title.orEmpty()
+        val match = Regex("""👤\s*(\d+)""").find(title)
+        return match?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+    }
+
+    private fun parseSize(stream: TorrentioStream): String {
+        val title = stream.title.orEmpty()
+        val match = Regex("""💾\s*([\d\.]+\s*[MGK]B)""").find(title)
+        return match?.groupValues?.getOrNull(1) ?: ""
+    }
+
     private fun formatStreamTitle(stream: TorrentioStream, isDebrid: Boolean): String {
-        val header = stream.name?.replace("Torrentio\n", "")?.replace("\n", " ")?.trim() ?: "Torrentio"
-        val tag = if (isDebrid) "⚡ [Debrid]" else "🧲 [P2P Torrent]"
-        val details = stream.title?.replace("\n", " • ")?.trim() ?: ""
-        return if (details.isNotBlank()) "$tag $header | $details" else "$tag $header"
+        val res = parseQualityString(stream.name, stream.title)
+        val seeds = parseSeeds(stream)
+        val size = parseSize(stream)
+        val releaseName = stream.title?.lines()?.firstOrNull()?.trim() ?: stream.name.orEmpty()
+        val tag = if (isDebrid) "⚡ [Debrid]" else "🧲"
+
+        val meta = buildString {
+            append("[$res]")
+            if (size.isNotBlank()) append(" 💾 $size")
+            if (!isDebrid && seeds > 0) append(" 👤 $seeds seeds")
+        }
+
+        return if (releaseName.isNotBlank() && !releaseName.contains("👤")) {
+            "$tag $meta • $releaseName"
+        } else {
+            "$tag $meta"
+        }
     }
 
     companion object {
