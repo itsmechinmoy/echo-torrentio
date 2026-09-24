@@ -31,6 +31,7 @@ object TorrentServerManager {
     var logger: (String) -> Unit = { println("[TorrentServerManager] $it") }
 
     private val sessionManager: SessionManager? by lazy {
+        initNativeLibrary()
         try {
             SessionManager()
         } catch (t: Throwable) {
@@ -568,6 +569,106 @@ object TorrentServerManager {
             }
         } catch (e: Exception) {
             e.printStackTrace()
+        }
+    }
+
+    /**
+     * Resolves the native libtorrent4j library (.so) on Android:
+     * 1. Checks Echo's extracted library directory (context.cacheDir/libs/torrentio)
+     * 2. Checks nativeLibraryDir of the host app
+     * 3. Extracts directly from the extension APK if needed
+     * 4. Sets System property "libtorrent4j.jni.path" and invokes System.load()
+     */
+    fun initNativeLibrary() {
+        if (System.getProperty("libtorrent4j.jni.path") != null) return
+
+        val appContext = runCatching {
+            val activityThread = Class.forName("android.app.ActivityThread")
+            val currentApplication = activityThread.getMethod("currentApplication")
+            currentApplication.invoke(null)
+        }.getOrNull() ?: return
+
+        try {
+            val getCacheDir = appContext.javaClass.getMethod("getCacheDir")
+            val cacheDir = getCacheDir.invoke(appContext) as? File
+
+            val candidateDirs = mutableListOf<File>()
+            if (cacheDir != null) {
+                candidateDirs.add(File(cacheDir, "libs/torrentio"))
+                candidateDirs.add(File(cacheDir, "libs"))
+            }
+
+            runCatching {
+                val getAppInfo = appContext.javaClass.getMethod("getApplicationInfo")
+                val appInfo = getAppInfo.invoke(appContext)
+                val nativeLibDirField = appInfo.javaClass.getField("nativeLibraryDir")
+                val nativeLibDirPath = nativeLibDirField.get(appInfo) as? String
+                if (!nativeLibDirPath.isNullOrBlank()) {
+                    candidateDirs.add(File(nativeLibDirPath))
+                }
+            }
+
+            for (dir in candidateDirs) {
+                val soFile = File(dir, "libtorrent4j.so")
+                if (soFile.exists() && soFile.length() > 0) {
+                    System.setProperty("libtorrent4j.jni.path", soFile.absolutePath)
+                    runCatching { System.load(soFile.absolutePath) }
+                    logger("Loaded native libtorrent4j from: ${soFile.absolutePath}")
+                    return
+                }
+            }
+
+            // Fallback: extract directly from the extension's installed APK
+            if (cacheDir != null) {
+                val targetDir = File(cacheDir, "libs/torrentio").apply { mkdirs() }
+                val targetSo = File(targetDir, "libtorrent4j.so")
+
+                val getPackageManager = appContext.javaClass.getMethod("getPackageManager")
+                val pm = getPackageManager.invoke(appContext)
+                val getPackageInfo = pm.javaClass.getMethod("getPackageInfo", String::class.java, Int::class.javaPrimitiveType)
+                val pkgInfo = runCatching {
+                    getPackageInfo.invoke(pm, "dev.brahmkshatriya.echo.extension.torrentio", 0)
+                }.getOrNull()
+
+                if (pkgInfo != null) {
+                    val appInfoField = pkgInfo.javaClass.getField("applicationInfo")
+                    val appInfo = appInfoField.get(pkgInfo)
+                    val sourceDirField = appInfo.javaClass.getField("sourceDir")
+                    val apkPath = sourceDirField.get(appInfo) as? String
+
+                    if (apkPath != null && File(apkPath).exists()) {
+                        val zip = java.util.zip.ZipFile(apkPath)
+                        val supportedAbis = try {
+                            val buildClass = Class.forName("android.os.Build")
+                            val abisField = buildClass.getField("SUPPORTED_ABIS")
+                            @Suppress("UNCHECKED_CAST")
+                            abisField.get(null) as? Array<String>
+                        } catch (_: Exception) { null } ?: arrayOf("arm64-v8a", "armeabi-v7a")
+
+                        var entry: java.util.zip.ZipEntry? = null
+                        for (abi in supportedAbis) {
+                            entry = zip.getEntry("lib/$abi/libtorrent4j.so")
+                            if (entry != null) break
+                        }
+
+                        if (entry != null) {
+                            zip.getInputStream(entry).use { input ->
+                                targetSo.outputStream().use { output ->
+                                    input.copyTo(output)
+                                }
+                            }
+                            zip.close()
+                            System.setProperty("libtorrent4j.jni.path", targetSo.absolutePath)
+                            runCatching { System.load(targetSo.absolutePath) }
+                            logger("Extracted and loaded native libtorrent4j from APK to: ${targetSo.absolutePath}")
+                            return
+                        }
+                        zip.close()
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            logger("initNativeLibrary warning: ${t.message}")
         }
     }
 }
