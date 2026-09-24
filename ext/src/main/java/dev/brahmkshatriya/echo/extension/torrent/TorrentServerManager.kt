@@ -1,5 +1,11 @@
 package dev.brahmkshatriya.echo.extension.torrent
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.libtorrent4j.Priority
 import org.libtorrent4j.SessionManager
 import org.libtorrent4j.SessionParams
@@ -11,6 +17,15 @@ import org.libtorrent4j.TorrentInfo
 import java.io.File
 import java.net.ServerSocket
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+
+data class TorrentStreamMeta(
+    val infoHash: String,
+    val fileIdx: Int,
+    val magnetUrl: String,
+    val title: String
+)
 
 object TorrentServerManager {
     var logger: (String) -> Unit = { println("[TorrentServerManager] $it") }
@@ -28,6 +43,14 @@ object TorrentServerManager {
     var activeTorrentHash: String? = null
     var serverPort: Int = 8090
         private set
+
+    // Stream metadata registry: maps "${infoHash}_${fileIdx}" to metadata
+    private val registeredStreams = ConcurrentHashMap<String, TorrentStreamMeta>()
+
+    // Active connection tracking & idle auto-pause watchdog
+    private val activeConnections = AtomicInteger(0)
+    private var idlePauseJob: Job? = null
+    private val watchdogScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     val DEFAULT_TRACKERS = listOf(
         "udp://tracker.opentrackr.org:1337/announce",
@@ -98,12 +121,8 @@ object TorrentServerManager {
             }
 
             serverPort = findFreePort(8090)
-            httpServer = TorrentHttpServer(serverPort, { hash ->
-                try {
-                    sessionManager?.find(Sha1Hash.parseHex(hash))
-                } catch (_: Exception) {
-                    null
-                }
+            httpServer = TorrentHttpServer(serverPort, { hash, fileIndex ->
+                prepareAndGetHandle(hash, fileIndex)
             }, {
                 getTorrentCacheDir().absolutePath
             }, logger)
@@ -118,6 +137,10 @@ object TorrentServerManager {
     @Synchronized
     fun stop() {
         logger("Stopping TorrentServerManager...")
+        synchronized(this) {
+            idlePauseJob?.cancel()
+            idlePauseJob = null
+        }
         httpServer?.stop()
         httpServer = null
         try {
@@ -129,6 +152,187 @@ object TorrentServerManager {
     }
 
     fun isRunning(): Boolean = (sessionManager?.isRunning == true) || (httpServer != null)
+
+    fun registerStream(infoHash: String, fileIdx: Int, magnetUrl: String, title: String) {
+        val key = "${infoHash.lowercase()}_$fileIdx"
+        registeredStreams[key] = TorrentStreamMeta(infoHash, fileIdx, magnetUrl, title)
+    }
+
+    fun getStreamUrl(torrentHash: String, fileIndex: Int, preferredName: String = "video.mkv"): String {
+        start()
+        val cleanName = preferredName.substringAfterLast("/").substringAfterLast("\\").ifBlank { "video.mkv" }
+        val encodedName = runCatching { URLEncoder.encode(cleanName, "UTF-8") }.getOrDefault("video.mkv")
+        return "http://127.0.0.1:$serverPort/stream/$encodedName?hash=$torrentHash&index=$fileIndex"
+    }
+
+    fun getLink(torrentHash: String, fileIndex: Int): String = getStreamUrl(torrentHash, fileIndex)
+
+    fun onStreamClientConnected() {
+        val active = activeConnections.incrementAndGet()
+        logger("Stream client connected. Active connections: $active")
+        synchronized(this) {
+            idlePauseJob?.cancel()
+            idlePauseJob = null
+        }
+        resumeActiveTorrent()
+    }
+
+    fun onStreamClientDisconnected() {
+        val active = activeConnections.decrementAndGet()
+        logger("Stream client disconnected. Active connections: $active")
+        if (active <= 0) {
+            synchronized(this) {
+                idlePauseJob?.cancel()
+                idlePauseJob = watchdogScope.launch {
+                    delay(12_000L) // 12-second grace period for seek or track change
+                    if (activeConnections.get() <= 0) {
+                        logger("No active streaming clients for 12s. Pausing active torrent engine to save battery & data.")
+                        pauseActiveTorrent()
+                    }
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun pauseActiveTorrent() {
+        try {
+            val sm = sessionManager ?: return
+            val hash = activeTorrentHash ?: return
+            val sha1 = Sha1Hash.parseHex(hash)
+            val handle = sm.find(sha1)
+            if (handle != null && handle.isValid) {
+                logger("Pausing active torrent: $hash")
+                handle.pause()
+            }
+        } catch (e: Exception) {
+            logger("Failed to pause torrent: ${e.message}")
+        }
+    }
+
+    @Synchronized
+    fun resumeActiveTorrent() {
+        try {
+            val sm = sessionManager ?: return
+            val hash = activeTorrentHash ?: return
+            val sha1 = Sha1Hash.parseHex(hash)
+            val handle = sm.find(sha1)
+            if (handle != null && handle.isValid) {
+                logger("Resuming active torrent: $hash")
+                handle.resume()
+            }
+        } catch (e: Exception) {
+            logger("Failed to resume torrent: ${e.message}")
+        }
+    }
+
+    /**
+     * Lazily activates the requested torrent on-demand when ExoPlayer opens the stream.
+     * Pauses any previously running torrent so only 1 torrent runs at any given time.
+     */
+    @Synchronized
+    fun prepareAndGetHandle(hash: String, fileIndex: Int): TorrentHandle? {
+        start()
+        val sm = sessionManager ?: run {
+            logger("SessionManager not loaded, skipping p2p torrent download")
+            return null
+        }
+
+        val sha1 = try {
+            Sha1Hash.parseHex(hash)
+        } catch (_: Exception) {
+            return null
+        }
+
+        // If user switched to another torrent or episode, pause the previous one
+        if (activeTorrentHash != null && !activeTorrentHash.equals(hash, ignoreCase = true)) {
+            logger("Switching active torrent from $activeTorrentHash to $hash: pausing previous torrent")
+            pauseActiveTorrent()
+        }
+
+        var handle = sm.find(sha1)
+        if (handle == null || !handle.isValid) {
+            val meta = registeredStreams["${hash.lowercase()}_$fileIndex"]
+                ?: registeredStreams.values.firstOrNull { it.infoHash.equals(hash, ignoreCase = true) }
+            val rawMagnet = meta?.magnetUrl ?: "magnet:?xt=urn:btih:$hash"
+            val enhancedUrl = enhanceMagnetUrl(rawMagnet)
+
+            pruneCache() // Keep temporary cache bounded (LRU)
+
+            logger("Initiating on-demand sequential download for torrent: $hash")
+            val cacheDir = getTorrentCacheDir()
+            sm.download(enhancedUrl, cacheDir, TorrentFlags.SEQUENTIAL_DOWNLOAD)
+            handle = sm.find(sha1)
+        }
+
+        activeTorrentHash = hash
+
+        if (handle != null && handle.isValid) {
+            handle.resume()
+
+            // Wait for metadata (up to 30 seconds)
+            var waitTime = 0
+            while (handle.torrentFile() == null && waitTime < 300) {
+                Thread.sleep(100)
+                waitTime++
+                handle = sm.find(sha1) ?: handle
+            }
+
+            val torrentInfo = handle.torrentFile()
+            if (torrentInfo != null) {
+                val numFiles = torrentInfo.numFiles()
+                if (fileIndex in 0 until numFiles) {
+                    val priorities = Array(numFiles) { Priority.IGNORE }
+                    priorities[fileIndex] = Priority.TOP_PRIORITY
+                    handle.prioritizeFiles(priorities)
+
+                    // Trigger 1% head and 1% tail piece deadlines
+                    setupPrebufferPieces(handle, torrentInfo, fileIndex)
+                }
+            }
+        }
+
+        return handle
+    }
+
+    private fun setupPrebufferPieces(handle: TorrentHandle, torrentInfo: TorrentInfo, fileIndex: Int) {
+        try {
+            val fileStorage = torrentInfo.files()
+            val fileOffset = fileStorage.fileOffset(fileIndex)
+            val fileSize = fileStorage.fileSize(fileIndex)
+            val pieceLength = torrentInfo.pieceLength().toLong()
+            val numPiecesTotal = torrentInfo.numPieces()
+
+            val firstPiece = (fileOffset / pieceLength).toInt()
+            val lastPiece = if (fileSize > 0) ((fileOffset + fileSize - 1) / pieceLength).toInt() else firstPiece
+
+            val numPiecesOnePercent = if (fileSize > 0 && pieceLength > 0) {
+                ((fileSize * 0.01) / pieceLength).toInt().coerceIn(2, 16)
+            } else 2
+
+            logger("Setting piece deadlines for file $fileIndex: $numPiecesOnePercent head pieces, $numPiecesOnePercent tail pieces")
+
+            // 1. Prioritize Head Pieces (Container Headers & Initial Video Chunks)
+            for (i in 0 until numPiecesOnePercent) {
+                val p = firstPiece + i
+                if (p <= lastPiece && p < numPiecesTotal) {
+                    handle.piecePriority(p, Priority.TOP_PRIORITY)
+                    handle.setPieceDeadline(p, i * 200)
+                }
+            }
+
+            // 2. Prioritize Tail Pieces (moov atom / Matroska Cues)
+            for (i in 0 until numPiecesOnePercent) {
+                val p = lastPiece - i
+                if (p >= firstPiece && p < numPiecesTotal) {
+                    handle.piecePriority(p, Priority.DEFAULT)
+                    handle.setPieceDeadline(p, 2000 + (i * 400))
+                }
+            }
+        } catch (e: Exception) {
+            logger("Failed to setup piece deadlines: ${e.message}")
+        }
+    }
 
     fun enhanceMagnetUrl(url: String): String {
         if (!url.startsWith("magnet:", ignoreCase = true)) return url
@@ -201,11 +405,6 @@ object TorrentServerManager {
         return handle
     }
 
-    /**
-     * Pre-buffers video file using 1% Head + 1% Tail piece algorithm.
-     * Ensures container header and moov atom / Matroska Cues are downloaded
-     * before ExoPlayer begins playback.
-     */
     fun prebuffer(torrentHash: String, fileIndex: Int): Boolean {
         try {
             val sm = sessionManager ?: return false
@@ -268,24 +467,6 @@ object TorrentServerManager {
             e.printStackTrace()
             return false
         }
-    }
-
-    fun getLink(torrentHash: String, fileIndex: Int): String {
-        start()
-        val fileName = try {
-            val sm = sessionManager
-            if (sm != null) {
-                val sha1 = Sha1Hash.parseHex(torrentHash)
-                val handle = sm.find(sha1)
-                handle?.torrentFile()?.files()?.filePath(fileIndex)?.substringAfterLast("/") ?: "video.mkv"
-            } else {
-                "video.mkv"
-            }
-        } catch (_: Exception) {
-            "video.mkv"
-        }
-        val encodedName = runCatching { URLEncoder.encode(fileName, "UTF-8") }.getOrDefault("video.mkv")
-        return "http://127.0.0.1:$serverPort/stream/$encodedName?hash=$torrentHash&index=$fileIndex"
     }
 
     fun removeTorrent(torrentHash: String) {
@@ -369,7 +550,7 @@ object TorrentServerManager {
         return null
     }
 
-    fun pruneCache(maxSizeBytes: Long = 4L * 1024L * 1024L * 1024L) {
+    fun pruneCache(maxSizeBytes: Long = 3L * 1024L * 1024L * 1024L) {
         try {
             val cacheDir = getTorrentCacheDir()
             val files = cacheDir.listFiles() ?: return
