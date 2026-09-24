@@ -12,7 +12,7 @@ import java.util.concurrent.Executors
 
 class TorrentHttpServer(
     private val port: Int,
-    private val getTorrentHandle: (String) -> TorrentHandle?,
+    private val getTorrentHandle: (String, Int) -> TorrentHandle?,
     private val getSavePath: () -> String,
     private val logger: (String) -> Unit = { println("[TorrentHttpServer] $it") }
 ) {
@@ -32,7 +32,7 @@ class TorrentHttpServer(
                         val socket = serverSocket?.accept() ?: break
                         executor.submit { handleClient(socket) }
                     } catch (_: Exception) {
-                        // socket closed or error
+                        // Socket closed or error
                     }
                 }
             }
@@ -53,6 +53,7 @@ class TorrentHttpServer(
     }
 
     private fun handleClient(socket: Socket) {
+        var isStreamActive = false
         socket.use { client ->
             try {
                 client.tcpNoDelay = true
@@ -95,9 +96,15 @@ class TorrentHttpServer(
                 }
 
                 val fileIndex = indexStr.toIntOrNull() ?: 0
-                val torrentHandle = getTorrentHandle(hash)
+
+                // Track active stream connection
+                TorrentServerManager.onStreamClientConnected()
+                isStreamActive = true
+
+                // On-demand activation & handle retrieval
+                val torrentHandle = getTorrentHandle(hash, fileIndex)
                 if (torrentHandle == null || !torrentHandle.isValid) {
-                    sendError(client.getOutputStream(), 404, "Torrent not found")
+                    sendError(client.getOutputStream(), 404, "Torrent not found or metadata timed out")
                     return
                 }
 
@@ -105,7 +112,7 @@ class TorrentHttpServer(
                 if (torrentInfo == null) {
                     var waitMetadata = 0
                     while (torrentHandle.torrentFile() == null && waitMetadata < 300) {
-                        if (!isRunning || !torrentHandle.isValid) break
+                        if (!isRunning || !torrentHandle.isValid || client.isClosed) break
                         Thread.sleep(100)
                         waitMetadata++
                     }
@@ -113,7 +120,7 @@ class TorrentHttpServer(
                 }
 
                 if (torrentInfo == null) {
-                    sendError(client.getOutputStream(), 400, "Metadata timeout")
+                    sendError(client.getOutputStream(), 504, "Metadata timeout")
                     return
                 }
 
@@ -239,15 +246,19 @@ class TorrentHttpServer(
                         var waitCount = 0
                         var loggedWait = false
                         while (!torrentHandle.havePiece(pieceIndex)) {
-                            if (!isRunning || !torrentHandle.isValid) break
+                            if (!isRunning || !torrentHandle.isValid || client.isClosed) break
                             if (!loggedWait) {
                                 logger("Waiting for piece $pieceIndex at position $currentPosition...")
                                 loggedWait = true
                             }
                             Thread.sleep(50)
                             waitCount++
+                            if (waitCount > 600) { // 30s timeout
+                                logger("Timeout waiting for piece $pieceIndex")
+                                break
+                            }
                         }
-                        if (!isRunning || !torrentHandle.isValid) break
+                        if (!isRunning || !torrentHandle.isValid || client.isClosed) break
 
                         // 2. Determine how many bytes we can read from current piece
                         val pieceEndByteInTorrent = (pieceIndex.toLong() + 1) * pieceLength
@@ -262,7 +273,7 @@ class TorrentHttpServer(
                         var bytesRead = -1
                         var readAttempts = 0
                         while (readAttempts < 200) {
-                            if (!isRunning || !torrentHandle.isValid) break
+                            if (!isRunning || !torrentHandle.isValid || client.isClosed) break
                             try {
                                 if (targetFile.exists()) {
                                     if (fileChannel == null) {
@@ -302,8 +313,12 @@ class TorrentHttpServer(
                     fileChannel?.close()
                 }
 
-            } catch (_: Exception) {
-                // Connection reset by peer or similar
+            } catch (e: Exception) {
+                logger("Socket connection error: ${e.message}")
+            } finally {
+                if (isStreamActive) {
+                    TorrentServerManager.onStreamClientDisconnected()
+                }
             }
         }
     }
