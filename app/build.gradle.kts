@@ -11,8 +11,6 @@ dependencies {
     implementation(libs.libtorrent4j)
     implementation(libs.libtorrent4j.android.arm)
     implementation(libs.libtorrent4j.android.arm64)
-    implementation(libs.libtorrent4j.android.x86)
-    implementation(libs.libtorrent4j.android.x86.x64)
 }
 
 configurations.all {
@@ -41,6 +39,11 @@ java {
 
 kotlin {
     jvmToolchain(21)
+    compilerOptions {
+        freeCompilerArgs.addAll(
+            "-Xlambdas=class"
+        )
+    }
 }
 
 val extType: String by project
@@ -77,6 +80,12 @@ tasks.register("generateProguardRules") {
                 -keep class org.libtorrent4j.** { *; }
                 -keep class com.frostwire.jlibtorrent.** { *; }
                 -keep class org.libtorrent4j.swig.libtorrent_jni { *; }
+                -keep class kotlin.jvm.functions.** { *; }
+                -keep interface kotlin.jvm.functions.** { *; }
+                -keep class * implements kotlin.jvm.functions.Function* { *; }
+                -keepclassmembers class * implements kotlin.jvm.functions.Function* {
+                    public <methods>;
+                }
                 -keepclassmembers class * {
                     @kotlinx.serialization.Serializable <fields>;
                     @kotlinx.serialization.Serializable <init>(...);
