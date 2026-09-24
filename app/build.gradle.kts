@@ -7,15 +7,34 @@ dependencies {
     implementation(project(":ext"))
     compileOnly(libs.echo.common)
     compileOnly(libs.kotlin.stdlib)
+
+    implementation(libs.libtorrent4j)
+    implementation(libs.libtorrent4j.android.arm)
+    implementation(libs.libtorrent4j.android.arm64)
+    implementation(libs.libtorrent4j.android.x86)
+    implementation(libs.libtorrent4j.android.x86.x64)
+}
+
+configurations.all {
+    resolutionStrategy {
+        force("org.jetbrains.kotlin:kotlin-stdlib:2.2.10")
+        force("org.jetbrains.kotlin:kotlin-stdlib-jdk8:2.2.10")
+        force("org.jetbrains.kotlin:kotlin-stdlib-jdk7:2.2.10")
+        force("org.jetbrains.kotlin:kotlin-stdlib-common:2.2.10")
+    }
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk7")
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-common")
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 kotlin {
-    jvmToolchain(17)
+    jvmToolchain(21)
 }
 
 val extType: String by project
@@ -47,7 +66,16 @@ tasks.register("generateProguardRules") {
         generatedProguard.writeText(
             """
                 -dontobfuscate
-                -keep,allowoptimization class dev.brahmkshatriya.echo.extension.$extClass
+                -keep,allowoptimization class dev.brahmkshatriya.echo.extension.** { *; }
+                -keep class org.libtorrent4j.** { *; }
+                -keep class com.frostwire.jlibtorrent.** { *; }
+                -keep class org.libtorrent4j.swig.libtorrent_jni { *; }
+                -keepclassmembers class * {
+                    @kotlinx.serialization.Serializable <fields>;
+                    @kotlinx.serialization.Serializable <init>(...);
+                }
+                -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+                -dontwarn **
                 """.trimMargin()
         )
     }
