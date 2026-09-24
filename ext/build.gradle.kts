@@ -9,14 +9,19 @@ plugins {
 dependencies {
     compileOnly(libs.echo.common)
     compileOnly(libs.kotlin.stdlib)
+    compileOnly(libs.kotlinx.serialization.json)
 
-    implementation(libs.kotlinx.serialization.json)
-    implementation(libs.okhttp)
+    implementation(libs.okhttp) {
+        exclude(group = "org.jetbrains.kotlin")
+        exclude(group = "org.jetbrains.kotlinx")
+    }
     implementation(libs.libtorrent4j)
 
     testImplementation(libs.junit)
     testImplementation(libs.coroutines.test)
     testImplementation(libs.echo.common)
+    testImplementation(libs.kotlinx.serialization.json)
+    testImplementation(libs.okhttp)
     testImplementation(libs.libtorrent4j.windows)
 }
 
@@ -66,6 +71,12 @@ tasks {
     shadowJar {
         archiveBaseName.set(extId)
         archiveVersion.set(verName)
+
+        exclude("kotlin/**")
+        exclude("kotlinx/coroutines/**")
+        exclude("kotlinx/serialization/**")
+        exclude("META-INF/kotlin*")
+
         manifest {
             attributes(
                 mapOf(
@@ -91,6 +102,8 @@ tasks {
     }
 }
 
-fun execute(vararg command: String): String = providers.exec {
-    commandLine(*command)
-}.standardOutput.asText.get().trim()
+fun execute(vararg command: String): String = runCatching {
+    providers.exec {
+        commandLine(*command)
+    }.standardOutput.asText.get().trim()
+}.getOrElse { "1" }
