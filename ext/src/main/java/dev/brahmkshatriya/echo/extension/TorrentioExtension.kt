@@ -560,11 +560,14 @@ class TorrentioExtension :
                     }
                 }
 
-                // Add to TorrentServerManager and trigger 1% head/tail prebuffering
-                TorrentServerManager.addTorrent(magnet, stream.title ?: infoHash)
-                TorrentServerManager.prebuffer(infoHash, fileIdx)
+                // Register stream metadata in-memory (instant ~0ms, non-blocking)
+                TorrentServerManager.registerStream(infoHash, fileIdx, magnet, stream.title ?: infoHash)
 
-                val localStreamUrl = TorrentServerManager.getLink(infoHash, fileIdx)
+                val localStreamUrl = TorrentServerManager.getStreamUrl(
+                    infoHash,
+                    fileIdx,
+                    stream.behaviorHints?.filename ?: stream.title ?: "video.mkv"
+                )
                 sources.add(
                     Streamable.Source.Http(
                         request = NetworkRequest(url = localStreamUrl, headers = emptyMap()),
