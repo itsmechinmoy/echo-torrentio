@@ -32,6 +32,11 @@ java {
 
 kotlin {
     jvmToolchain(21)
+    compilerOptions {
+        freeCompilerArgs.addAll(
+            "-Xlambdas=class"
+        )
+    }
 }
 
 // Extension properties goto `gradle.properties` to set values
