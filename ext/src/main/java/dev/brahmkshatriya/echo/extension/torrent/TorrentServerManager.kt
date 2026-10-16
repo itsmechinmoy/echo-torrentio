@@ -95,20 +95,25 @@ object TorrentServerManager {
                     settings.setBoolean(org.libtorrent4j.swig.settings_pack.bool_types.announce_to_all_trackers.swigValue(), true)
                     settings.setBoolean(org.libtorrent4j.swig.settings_pack.bool_types.announce_to_all_tiers.swigValue(), true)
 
-                    // 2. Mobile-Optimized Disk I/O & OS RAM Cache
-                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.max_queued_disk_bytes.swigValue(), 16 * 1024 * 1024)
+                    // 2. Mobile-Optimized Disk I/O & OS RAM Cache (qBittorrent standard)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.max_queued_disk_bytes.swigValue(), 4 * 1024 * 1024)
                     settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.aio_threads.swigValue(), 4)
-                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.file_pool_size.swigValue(), 50)
-                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.checking_mem_usage.swigValue(), 1024)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.file_pool_size.swigValue(), 20)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.checking_mem_usage.swigValue(), 32)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.active_checking.swigValue(), 1)
 
-                    // Connection pacing for rapid swarm acquisition & streaming
-                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.connection_speed.swigValue(), 40)
+                    // Connection pacing & request queues (qBittorrent mobile guardrails)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.connections_limit.swigValue(), 40)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.connection_speed.swigValue(), 30)
                     settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.peer_turnover.swigValue(), 4)
                     settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.peer_turnover_cutoff.swigValue(), 90)
                     settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.peer_turnover_interval.swigValue(), 60)
-                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.max_out_request_queue.swigValue(), 1000)
-                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.max_allowed_in_request_queue.swigValue(), 2000)
-                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.unchoke_slots_limit.swigValue(), 12)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.max_out_request_queue.swigValue(), 80)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.max_allowed_in_request_queue.swigValue(), 160)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.unchoke_slots_limit.swigValue(), 8)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.send_buffer_watermark.swigValue(), 500 * 1024)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.send_buffer_low_watermark.swigValue(), 10 * 1024)
+                    settings.setInteger(org.libtorrent4j.swig.settings_pack.int_types.send_buffer_watermark_factor.swigValue(), 50)
 
                     // Listen interfaces
                     settings.setString(org.libtorrent4j.swig.settings_pack.string_types.listen_interfaces.swigValue(), "0.0.0.0:0,[::]:0")
@@ -185,9 +190,9 @@ object TorrentServerManager {
             synchronized(this) {
                 idlePauseJob?.cancel()
                 idlePauseJob = watchdogScope.launch {
-                    delay(12_000L) // 12-second grace period for seek or track change
+                    delay(3_000L) // 3-second grace period for seek or track change
                     if (activeConnections.get() <= 0) {
-                        logger("No active streaming clients for 12s. Pausing active torrent engine to save battery & data.")
+                        logger("No active streaming clients for 3s. Pausing active torrent engine to save battery & data.")
                         pauseActiveTorrent()
                     }
                 }
@@ -245,10 +250,19 @@ object TorrentServerManager {
             return null
         }
 
-        // If user switched to another torrent or episode, pause the previous one
+        // If user switched to another torrent, stop and remove the previous one to reclaim native heap
         if (activeTorrentHash != null && !activeTorrentHash.equals(hash, ignoreCase = true)) {
-            logger("Switching active torrent from $activeTorrentHash to $hash: pausing previous torrent")
-            pauseActiveTorrent()
+            val prevHash = activeTorrentHash!!
+            logger("Switching active torrent from $prevHash to $hash: purging previous torrent session")
+            try {
+                val oldSha1 = Sha1Hash.parseHex(prevHash)
+                val oldHandle = sm.find(oldSha1)
+                if (oldHandle != null && oldHandle.isValid) {
+                    sm.remove(oldHandle)
+                }
+            } catch (t: Throwable) {
+                logger("Warning removing previous torrent: ${t.message}")
+            }
         }
 
         var handle = sm.find(sha1)
@@ -287,7 +301,7 @@ object TorrentServerManager {
                     priorities[fileIndex] = Priority.TOP_PRIORITY
                     handle.prioritizeFiles(priorities)
 
-                    // Trigger 1% head and 1% tail piece deadlines
+                    // Apply qBittorrent 1% head and 1% tail piece priorities and ignore middle pieces
                     setupPrebufferPieces(handle, torrentInfo, fileIndex)
                 }
             }
@@ -307,13 +321,21 @@ object TorrentServerManager {
             val firstPiece = (fileOffset / pieceLength).toInt()
             val lastPiece = if (fileSize > 0) ((fileOffset + fileSize - 1) / pieceLength).toInt() else firstPiece
 
+            // qBittorrent formula: 1% of file size for head container headers and tail metadata
             val numPiecesOnePercent = if (fileSize > 0 && pieceLength > 0) {
                 ((fileSize * 0.01) / pieceLength).toInt().coerceIn(2, 16)
             } else 2
 
-            logger("Setting piece deadlines for file $fileIndex: $numPiecesOnePercent head pieces, $numPiecesOnePercent tail pieces")
+            logger("Setting qBittorrent piece priorities for file $fileIndex: $numPiecesOnePercent head pieces, $numPiecesOnePercent tail pieces")
 
-            // 1. Prioritize Head Pieces (Container Headers & Initial Video Chunks)
+            // Initialize all file pieces to IGNORE so background downloading doesn't saturate RAM/disk
+            for (p in firstPiece..lastPiece) {
+                if (p in 0 until numPiecesTotal) {
+                    handle.piecePriority(p, Priority.IGNORE)
+                }
+            }
+
+            // 1. Prioritize Head Pieces (Container Headers & Video Start)
             for (i in 0 until numPiecesOnePercent) {
                 val p = firstPiece + i
                 if (p <= lastPiece && p < numPiecesTotal) {
@@ -322,12 +344,12 @@ object TorrentServerManager {
                 }
             }
 
-            // 2. Prioritize Tail Pieces (moov atom / Matroska Cues)
+            // 2. Prioritize Tail Pieces (moov atom / Matroska Cues / Index)
             for (i in 0 until numPiecesOnePercent) {
                 val p = lastPiece - i
                 if (p >= firstPiece && p < numPiecesTotal) {
-                    handle.piecePriority(p, Priority.DEFAULT)
-                    handle.setPieceDeadline(p, 2000 + (i * 400))
+                    handle.piecePriority(p, Priority.TOP_PRIORITY)
+                    handle.setPieceDeadline(p, 2000 + (i * 300))
                 }
             }
         } catch (e: Exception) {
@@ -555,15 +577,24 @@ object TorrentServerManager {
         try {
             val cacheDir = getTorrentCacheDir()
             val files = cacheDir.listFiles() ?: return
-            var totalSize = files.sumOf { it.length() }
+
+            fun getPathSize(file: File): Long {
+                return if (file.isDirectory) {
+                    file.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                } else {
+                    file.length()
+                }
+            }
+
+            var totalSize = files.sumOf { getPathSize(it) }
             if (totalSize > maxSizeBytes) {
                 val sortedFiles = files.sortedBy { it.lastModified() }
                 for (file in sortedFiles) {
                     if (totalSize <= maxSizeBytes) break
-                    val size = file.length()
+                    val size = getPathSize(file)
                     if (file.deleteRecursively()) {
                         totalSize -= size
-                        logger("Pruned old torrent cache file ${file.name}")
+                        logger("Pruned old torrent cache file/folder ${file.name} ($size bytes)")
                     }
                 }
             }
