@@ -8,7 +8,9 @@ import java.io.RandomAccessFile
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class TorrentHttpServer(
     private val port: Int,
@@ -17,7 +19,8 @@ class TorrentHttpServer(
     private val logger: (String) -> Unit = { println("[TorrentHttpServer] $it") }
 ) {
     private var serverSocket: ServerSocket? = null
-    private val executor = Executors.newCachedThreadPool()
+    private val executor = Executors.newFixedThreadPool(4)
+    private val activeStreamCancelFlag = ConcurrentHashMap<String, AtomicBoolean>()
     @Volatile
     private var isRunning = false
 
@@ -44,6 +47,8 @@ class TorrentHttpServer(
 
     fun stop() {
         isRunning = false
+        activeStreamCancelFlag.values.forEach { it.set(true) }
+        activeStreamCancelFlag.clear()
         try {
             serverSocket?.close()
         } catch (_: Exception) {}
@@ -97,6 +102,11 @@ class TorrentHttpServer(
 
                 val fileIndex = indexStr.toIntOrNull() ?: 0
 
+                val streamKey = "${hash.lowercase()}_$fileIndex"
+                val oldCancel = activeStreamCancelFlag.put(streamKey, AtomicBoolean(false))
+                oldCancel?.set(true)
+                val myCancel = activeStreamCancelFlag[streamKey] ?: AtomicBoolean(false)
+
                 // Track active stream connection
                 TorrentServerManager.onStreamClientConnected()
                 isStreamActive = true
@@ -112,7 +122,7 @@ class TorrentHttpServer(
                 if (torrentInfo == null) {
                     var waitMetadata = 0
                     while (torrentHandle.torrentFile() == null && waitMetadata < 300) {
-                        if (!isRunning || !torrentHandle.isValid || client.isClosed) break
+                        if (myCancel.get() || !isRunning || !torrentHandle.isValid || client.isClosed) break
                         Thread.sleep(100)
                         waitMetadata++
                     }
@@ -139,6 +149,14 @@ class TorrentHttpServer(
                 val fileOffset = fileStorage.fileOffset(fileIndex)
                 val pieceLength = torrentInfo.pieceLength().toLong()
                 val totalPieces = torrentInfo.numPieces()
+
+                val firstPiece = (fileOffset / pieceLength).toInt()
+                val lastPiece = if (fileSize > 0) ((fileOffset + fileSize - 1) / pieceLength).toInt() else firstPiece
+                val numPiecesOnePercent = if (fileSize > 0 && pieceLength > 0) {
+                    ((fileSize * 0.01) / pieceLength).toInt().coerceIn(2, 16)
+                } else 2
+                val headEndPiece = firstPiece + numPiecesOnePercent
+                val tailStartPiece = lastPiece - numPiecesOnePercent + 1
 
                 // Read headers to check for HTTP Range
                 var rangeHeader: String? = null
@@ -211,32 +229,40 @@ class TorrentHttpServer(
 
                 try {
                     while (currentPosition <= endByte) {
+                        if (myCancel.get() || !isRunning || !torrentHandle.isValid || client.isClosed) break
+
                         val torrentByteOffset = fileOffset + currentPosition
                         val pieceIndex = (torrentByteOffset / pieceLength).toInt()
 
-                        // Adaptive 20MB Rolling Lookahead Window (dynamic piece budget)
+                        // Adaptive 25MB Rolling Lookahead Window (dynamic piece budget)
                         if (pieceIndex != lastPrebufferedPiece) {
-                            if (lastPrebufferedPiece != -1 && kotlin.math.abs(pieceIndex - lastPrebufferedPiece) > 2) {
-                                for (p in lastPrebufferedPiece until (lastPrebufferedPiece + lastLookaheadPieces)) {
-                                    if (p < totalPieces && p != pieceIndex) {
+                            if (lastPrebufferedPiece != -1) {
+                                val oldStart = lastPrebufferedPiece
+                                val oldEnd = lastPrebufferedPiece + lastLookaheadPieces
+                                for (p in oldStart until oldEnd) {
+                                    val inHeadOrTail = (p in firstPiece until headEndPiece) || (p in tailStartPiece..lastPiece)
+                                    val inNewWindow = (p in pieceIndex until (pieceIndex + 25))
+                                    if (!inHeadOrTail && !inNewWindow && p in 0 until totalPieces) {
                                         try {
                                             torrentHandle.resetPieceDeadline(p)
-                                            torrentHandle.piecePriority(p, Priority.DEFAULT)
+                                            if (!torrentHandle.havePiece(p)) {
+                                                torrentHandle.piecePriority(p, Priority.IGNORE)
+                                            }
                                         } catch (_: Exception) {}
                                     }
                                 }
                             }
 
                             lastPrebufferedPiece = pieceIndex
-                            val targetBufferBytes = 20L * 1024L * 1024L
+                            val targetBufferBytes = 25L * 1024L * 1024L
                             val safePieceLen = pieceLength.coerceAtLeast(1L)
-                            val lookaheadPieces = (targetBufferBytes / safePieceLen).toInt().coerceIn(4, 32)
+                            val lookaheadPieces = (targetBufferBytes / safePieceLen).toInt().coerceIn(4, 30)
                             lastLookaheadPieces = lookaheadPieces
                             for (i in 0 until lookaheadPieces) {
                                 val nextPiece = pieceIndex + i
-                                if (nextPiece < totalPieces) {
+                                if (nextPiece <= lastPiece && nextPiece < totalPieces) {
                                     torrentHandle.piecePriority(nextPiece, Priority.TOP_PRIORITY)
-                                    val deadlineMs = if (i == 0) 0 else (150 + i * 150)
+                                    val deadlineMs = if (i == 0) 0 else (100 + i * 150)
                                     torrentHandle.setPieceDeadline(nextPiece, deadlineMs)
                                 }
                             }
@@ -246,19 +272,19 @@ class TorrentHttpServer(
                         var waitCount = 0
                         var loggedWait = false
                         while (!torrentHandle.havePiece(pieceIndex)) {
-                            if (!isRunning || !torrentHandle.isValid || client.isClosed) break
+                            if (myCancel.get() || !isRunning || !torrentHandle.isValid || client.isClosed) break
                             if (!loggedWait) {
                                 logger("Waiting for piece $pieceIndex at position $currentPosition...")
                                 loggedWait = true
                             }
-                            Thread.sleep(50)
+                            Thread.sleep(25)
                             waitCount++
-                            if (waitCount > 600) { // 30s timeout
+                            if (waitCount > 400) { // 10s timeout
                                 logger("Timeout waiting for piece $pieceIndex")
                                 break
                             }
                         }
-                        if (!isRunning || !torrentHandle.isValid || client.isClosed) break
+                        if (myCancel.get() || !isRunning || !torrentHandle.isValid || client.isClosed) break
 
                         // 2. Determine how many bytes we can read from current piece
                         val pieceEndByteInTorrent = (pieceIndex.toLong() + 1) * pieceLength
@@ -273,7 +299,7 @@ class TorrentHttpServer(
                         var bytesRead = -1
                         var readAttempts = 0
                         while (readAttempts < 200) {
-                            if (!isRunning || !torrentHandle.isValid || client.isClosed) break
+                            if (myCancel.get() || !isRunning || !torrentHandle.isValid || client.isClosed) break
                             try {
                                 if (targetFile.exists()) {
                                     if (fileChannel == null) {
@@ -292,7 +318,7 @@ class TorrentHttpServer(
                                 fileChannel?.close()
                                 fileChannel = null
                             }
-                            Thread.sleep(50)
+                            Thread.sleep(25)
                             readAttempts++
                         }
 
@@ -306,7 +332,11 @@ class TorrentHttpServer(
                         output.flush()
                         currentPosition += bytesRead
                     }
-                    logger("Finished streaming requested range for file $fileIndex")
+                    if (myCancel.get()) {
+                        logger("Stream for file $fileIndex gracefully stopped (superseded by seek)")
+                    } else {
+                        logger("Finished streaming requested range for file $fileIndex")
+                    }
                 } catch (e: Exception) {
                     logger("Client disconnected or stream error: ${e.message}")
                 } finally {
